@@ -30,11 +30,19 @@ type Entry struct {
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+type Tx interface {
+	HasEntry(paymentID string, kind Kind) bool
+	Find(paymentID string, kind Kind) (Entry, bool)
+	AwardedInMonth(month string) int64
+	Append(e Entry)
+}
+
 type Store interface {
 	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
 	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
 	Append(ctx context.Context, e Entry) error
 	Balance(ctx context.Context, memberID string) (int64, error)
+	Transact(ctx context.Context, memberID string, fn func(Tx) error) error
 }
 
 type Option func(*MemoryStore)
@@ -50,16 +58,21 @@ func WithFaults(f func(op string) error) Option {
 	return func(s *MemoryStore) { s.faults = f }
 }
 
+type memberState struct {
+	mu      sync.Mutex
+	entries []Entry
+}
+
 type MemoryStore struct {
 	latency time.Duration
 	faults  func(op string) error
 
 	mu      sync.Mutex
-	entries []Entry
+	members map[string]*memberState
 }
 
 func NewMemoryStore(opts ...Option) *MemoryStore {
-	s := &MemoryStore{}
+	s := &MemoryStore{members: make(map[string]*memberState)}
 	for _, o := range opts {
 		o(s)
 	}
@@ -80,14 +93,32 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 	return nil
 }
 
+func (s *MemoryStore) member(id string) *memberState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.members[id]
+	if !ok {
+		st = &memberState{}
+		s.members[id] = st
+	}
+	return st
+}
+
 func (s *MemoryStore) HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error) {
 	if err := s.roundTrip(ctx, "has_entry"); err != nil {
 		return false, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, e := range s.entries {
-		if e.PaymentID == paymentID && e.Kind == kind {
+	states := make([]*memberState, 0, len(s.members))
+	for _, st := range s.members {
+		states = append(states, st)
+	}
+	s.mu.Unlock()
+	for _, st := range states {
+		st.mu.Lock()
+		found := findEntry(st.entries, paymentID, kind)
+		st.mu.Unlock()
+		if found {
 			return true, nil
 		}
 	}
@@ -98,24 +129,20 @@ func (s *MemoryStore) AwardedInMonth(ctx context.Context, memberID, month string
 	if err := s.roundTrip(ctx, "awarded_in_month"); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var total int64
-	for _, e := range s.entries {
-		if e.MemberID == memberID && e.Month == month && e.Kind == KindAward {
-			total += e.Points
-		}
-	}
-	return total, nil
+	st := s.member(memberID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return awardedInMonth(st.entries, month), nil
 }
 
 func (s *MemoryStore) Append(ctx context.Context, e Entry) error {
 	if err := s.roundTrip(ctx, "append"); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries = append(s.entries, e)
+	st := s.member(e.MemberID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.entries = append(st.entries, e)
 	return nil
 }
 
@@ -123,13 +150,71 @@ func (s *MemoryStore) Balance(ctx context.Context, memberID string) (int64, erro
 	if err := s.roundTrip(ctx, "balance"); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	st := s.member(memberID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	var total int64
-	for _, e := range s.entries {
-		if e.MemberID == memberID {
+	for _, e := range st.entries {
+		total += e.Points
+	}
+	return total, nil
+}
+
+func (s *MemoryStore) Transact(ctx context.Context, memberID string, fn func(Tx) error) error {
+	if err := s.roundTrip(ctx, "transact"); err != nil {
+		return err
+	}
+	st := s.member(memberID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	tx := &memTx{entries: append([]Entry(nil), st.entries...)}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	st.entries = tx.entries
+	return nil
+}
+
+type memTx struct {
+	entries []Entry
+}
+
+func (t *memTx) HasEntry(paymentID string, kind Kind) bool {
+	return findEntry(t.entries, paymentID, kind)
+}
+
+func (t *memTx) Find(paymentID string, kind Kind) (Entry, bool) {
+	for _, e := range t.entries {
+		if e.PaymentID == paymentID && e.Kind == kind {
+			return e, true
+		}
+	}
+	return Entry{}, false
+}
+
+func (t *memTx) AwardedInMonth(month string) int64 {
+	return awardedInMonth(t.entries, month)
+}
+
+func (t *memTx) Append(e Entry) {
+	t.entries = append(t.entries, e)
+}
+
+func findEntry(entries []Entry, paymentID string, kind Kind) bool {
+	for _, e := range entries {
+		if e.PaymentID == paymentID && e.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func awardedInMonth(entries []Entry, month string) int64 {
+	var total int64
+	for _, e := range entries {
+		if e.Month == month && e.Kind == KindAward {
 			total += e.Points
 		}
 	}
-	return total, nil
+	return total
 }
